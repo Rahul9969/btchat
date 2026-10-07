@@ -30,7 +30,14 @@ export function selectTransportKind(): TransportKind {
 }
 
 function createTransport(kind: TransportKind): Transport {
-  return new DaemonTransport();
+  switch (kind) {
+    case "mock":
+      return new MockTransport();
+    case "web-bluetooth":
+      return notImplemented("WebBluetoothTransport (Phase 5)");
+    case "native":
+      return new DaemonTransport();
+  }
 }
 
 let instance: Transport | null = null;
