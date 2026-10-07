@@ -115,6 +115,21 @@ export const sendText: (text: string) => Promise<void> = async (text) => {
   await current.sendText(text);
 };
 
-export const sendFile: (file: File) => Promise<void> = async () => {
-  throw new Error("NOT IMPLEMENTED: file transfer (Phase 4)");
+export const sendFile: (file: File) => Promise<void> = async (file) => {
+  if (!current) throw new Error("Not in a Group.");
+  
+  // File size validation (5MB max)
+  const MAX_SIZE = 5 * 1024 * 1024;
+  if (file.size > MAX_SIZE) {
+    throw new Error(`File is too large (${(file.size/1024/1024).toFixed(1)}MB). Max size is 5MB.`);
+  }
+
+  const transport = getTransport();
+  if (transport.sendFile) {
+    await transport.sendFile(file);
+    // Add system message indicating file is being sent
+    useChatStore.getState().addSystem(`Sending file: ${file.name}...`);
+  } else {
+    throw new Error("File transfer is not supported by this transport.");
+  }
 };

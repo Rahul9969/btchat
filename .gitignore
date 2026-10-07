@@ -27,6 +27,7 @@ __pycache__/
 *.py[cod]
 staging/
 received_files/
+ws_token.txt
 
 # debug
 npm-debug.log*

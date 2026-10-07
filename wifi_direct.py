@@ -30,15 +30,13 @@ class WiFiDirectManager:
         self.on_file_received = None
         self.on_progress = None
 
-    async def host_group(self, pin: str, on_file_received=None, on_progress=None):
+    async def host_send_file(self, file_path: str, pin: str, progress_callback=None):
         """
         Hosts a Wi-Fi Direct network using a temporary PIN and starts
-        the secure authenticated TCP receiver server.
+        a TCP server that sends the file to the first authenticated client.
         """
-        logger.info(f"Hosting Wi-Fi Direct Group with PIN: {pin}")
+        logger.info(f"Hosting Wi-Fi Direct Group to send file with PIN: {pin}")
         self.current_pin = pin
-        self.on_file_received = on_file_received
-        self.on_progress = on_progress
         self.peer_connected_event.clear()
 
         try:
@@ -52,57 +50,13 @@ class WiFiDirectManager:
         except Exception as e:
             logger.warning(f"WinRT Wi-Fi Direct Publisher Notice: {e}")
 
-        # Start authenticated TCP Server on the Wi-Fi Direct interface
-        await self._start_tcp_server()
+        # Start TCP server to send the file
+        file_size = os.path.getsize(file_path)
+        filename = os.path.basename(file_path)
 
-    async def connect_to_group(self, pin: str):
-        """Connects to a hosted Wi-Fi direct group using the provided PIN."""
-        logger.info(f"Scanning for Wi-Fi Direct Group with PIN: {pin}")
-        self.current_pin = pin
-        
-        try:
-            selector = WiFiDirectDevice.get_device_selector()
-            devices = await DeviceInformation.find_all_async(selector)
-            
-            if not devices or devices.size == 0:
-                logger.warning("No Wi-Fi Direct devices found in vicinity.")
-                return False
-                
-            host_device_id = devices.get_at(0).id
-            logger.info(f"Found Host Device ID: {host_device_id}")
-
-            connection_params = WiFiDirectConnectionParameters()
-            connection_params.preference_ordered_configuration_methods.append(
-                WiFiDirectConfigurationMethod.PIN_DISPLAY
-            )
-            cred = PasswordCredential()
-            cred.password = pin
-            
-            self.device = await WiFiDirectDevice.from_id_async(host_device_id, connection_params)
-            logger.info("Connected to Wi-Fi Direct Group successfully.")
-            return True
-        except Exception as e:
-            logger.warning(f"Wi-Fi Direct device connection notice: {e}")
-            return False
-
-    async def wait_for_peer_connection(self, timeout: float = 30.0) -> bool:
-        """Waits for a peer to connect to the hosted TCP socket."""
-        try:
-            await asyncio.wait_for(self.peer_connected_event.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            logger.warning("Timeout waiting for peer Wi-Fi Direct connection.")
-            return False
-
-    async def _start_tcp_server(self):
-        """
-        Starts an authenticated TCP socket server. Validates 4-byte PIN
-        before accepting any payload, mitigating unauthorized LAN file injection.
-        """
         async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             client_addr = writer.get_extra_info('peername')
-            logger.info(f"TCP Client connected from {client_addr}")
-            self.peer_ip = client_addr[0] if client_addr else "127.0.0.1"
+            logger.info(f"TCP Client connected from {client_addr} to receive file")
             self.peer_connected_event.set()
 
             try:
@@ -116,75 +70,85 @@ class WiFiDirectManager:
                     await writer.wait_closed()
                     return
 
-                # 2. Header parsing:
-                # [2 bytes: filename length] [8 bytes: file size] [filename]
-                header = await asyncio.wait_for(reader.readexactly(10), timeout=10.0)
-                filename_len = int.from_bytes(header[:2], 'big')
-                file_size = int.from_bytes(header[2:10], 'big')
+                # 2. Send Header: [2 bytes: NameLen] [8 bytes: Size] [FileName]
+                encoded_name = filename.encode('utf-8')
+                header = (
+                    len(encoded_name).to_bytes(2, 'big') +
+                    file_size.to_bytes(8, 'big') +
+                    encoded_name
+                )
+                writer.write(header)
+                await writer.drain()
 
-                raw_filename = await asyncio.wait_for(reader.readexactly(filename_len), timeout=10.0)
-                filename = os.path.basename(raw_filename.decode('utf-8', errors='replace'))
-                if not filename:
-                    filename = f"file_{int(os.urandom(2).hex(), 16)}.dat"
-
-                save_path = os.path.join(RECEIVED_DIR, filename)
-                logger.info(f"Receiving '{filename}' ({file_size} bytes) -> {save_path}")
-
-                # 3. Stream file contents
-                received_bytes = 0
-                with open(save_path, 'wb') as f:
-                    while received_bytes < file_size:
-                        to_read = min(CHUNK_SIZE, file_size - received_bytes)
-                        chunk = await asyncio.wait_for(reader.read(to_read), timeout=15.0)
+                # 3. Stream File Data
+                bytes_sent = 0
+                with open(file_path, "rb") as f:
+                    while bytes_sent < file_size:
+                        chunk = f.read(CHUNK_SIZE)
                         if not chunk:
                             break
-                        f.write(chunk)
-                        received_bytes += len(chunk)
-                        
-                        if self.on_progress:
-                            percent = int((received_bytes / file_size) * 100) if file_size > 0 else 100
-                            await self.on_progress(received_bytes, file_size, percent, 'download')
+                        writer.write(chunk)
+                        await writer.drain()
+                        bytes_sent += len(chunk)
 
-                # 4. Send acknowledgment back to client
-                writer.write(b"OK")
-                await writer.drain()
-                logger.info(f"Successfully received '{filename}' ({received_bytes}/{file_size} bytes)")
+                        if progress_callback:
+                            percent = int((bytes_sent / file_size) * 100) if file_size > 0 else 100
+                            await progress_callback(bytes_sent, file_size, percent, 'upload')
 
-                if self.on_file_received:
-                    await self.on_file_received(filename, save_path, received_bytes)
+                # 4. Wait for receiver ACK
+                ack = await asyncio.wait_for(reader.read(2), timeout=10.0)
+                if ack == b"OK":
+                    logger.info(f"Successfully sent '{filename}' ({bytes_sent} bytes)")
+                else:
+                    logger.warning(f"Transfer completed but unexpected ACK: {ack}")
 
             except Exception as e:
-                logger.error(f"Error handling TCP client stream: {e}")
+                logger.error(f"Error sending file via TCP: {e}")
             finally:
                 try:
                     writer.close()
                     await writer.wait_closed()
                 except Exception:
                     pass
+                # Stop the server after one transfer
+                if self.tcp_server:
+                    self.tcp_server.close()
 
         try:
             if self.tcp_server:
                 self.tcp_server.close()
                 await self.tcp_server.wait_closed()
             self.tcp_server = await asyncio.start_server(handle_client, '0.0.0.0', PORT)
-            logger.info(f"Secure Wi-Fi Direct TCP Server listening on port {PORT}")
+            logger.info(f"Secure TCP Server listening on port {PORT}")
         except Exception as e:
             logger.error(f"Failed to start TCP Server: {e}")
 
-    async def send_file(self, host_ip: str, file_path: str, pin: str, progress_callback=None) -> bool:
-        """
-        Sends a file over the established Wi-Fi Direct TCP link with PIN authentication
-        and chunked streaming progress updates.
-        """
-        if not os.path.exists(file_path):
-            logger.error(f"File to send does not exist: {file_path}")
-            return False
 
-        file_size = os.path.getsize(file_path)
-        filename = os.path.basename(file_path)
-        logger.info(f"Initiating high-speed file transfer of '{filename}' ({file_size} bytes) to {host_ip}:{PORT}")
-
+    async def connect_receive_file(self, pin: str, host_ip: str, progress_callback=None, on_file_received=None):
+        """
+        Connects to a Wi-Fi Direct group (or local IP) and receives a file.
+        Enforces 5MB size limit and validates received bytes.
+        """
+        logger.info(f"Connecting to {host_ip}:{PORT} to receive file with PIN: {pin}")
+        
         try:
+            # Try to connect via Wi-Fi Direct if not localhost
+            if host_ip != "127.0.0.1":
+                selector = WiFiDirectDevice.get_device_selector()
+                devices = await DeviceInformation.find_all_async(selector)
+                
+                if devices and devices.size > 0:
+                    host_device_id = devices.get_at(0).id
+                    connection_params = WiFiDirectConnectionParameters()
+                    connection_params.preference_ordered_configuration_methods.append(
+                        WiFiDirectConfigurationMethod.PIN_DISPLAY
+                    )
+                    cred = PasswordCredential()
+                    cred.password = pin
+                    self.device = await WiFiDirectDevice.from_id_async(host_device_id, connection_params)
+                    logger.info("Connected to Wi-Fi Direct Group")
+
+            # Connect TCP Client
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host_ip, PORT),
                 timeout=15.0
@@ -192,45 +156,64 @@ class WiFiDirectManager:
 
             # 1. Send 4-byte Authentication PIN
             writer.write(pin.encode('utf-8')[:4])
-
-            # 2. Send Header: [2 bytes: NameLen] [8 bytes: Size] [FileName]
-            encoded_name = filename.encode('utf-8')
-            header = (
-                len(encoded_name).to_bytes(2, 'big') +
-                file_size.to_bytes(8, 'big') +
-                encoded_name
-            )
-            writer.write(header)
             await writer.drain()
 
-            # 3. Stream File Data in 64KB Chunks
-            bytes_sent = 0
-            with open(file_path, "rb") as f:
-                while bytes_sent < file_size:
-                    chunk = f.read(CHUNK_SIZE)
+            # 2. Header parsing:
+            header = await asyncio.wait_for(reader.readexactly(10), timeout=10.0)
+            filename_len = int.from_bytes(header[:2], 'big')
+            file_size = int.from_bytes(header[2:10], 'big')
+
+            # MAX_SIZE limit check (5MB)
+            if file_size > 5 * 1024 * 1024:
+                logger.error(f"File too large: {file_size} bytes. Limit is 5MB.")
+                writer.close()
+                await writer.wait_closed()
+                return False
+
+            raw_filename = await asyncio.wait_for(reader.readexactly(filename_len), timeout=10.0)
+            filename = os.path.basename(raw_filename.decode('utf-8', errors='replace'))
+            if not filename:
+                filename = f"file_{int(os.urandom(2).hex(), 16)}.dat"
+
+            save_path = os.path.join(RECEIVED_DIR, filename)
+            logger.info(f"Receiving '{filename}' ({file_size} bytes) -> {save_path}")
+
+            # 3. Stream file contents
+            received_bytes = 0
+            with open(save_path, 'wb') as f:
+                while received_bytes < file_size:
+                    to_read = min(CHUNK_SIZE, file_size - received_bytes)
+                    chunk = await asyncio.wait_for(reader.read(to_read), timeout=15.0)
                     if not chunk:
                         break
-                    writer.write(chunk)
-                    await writer.drain()
-                    bytes_sent += len(chunk)
-
+                    f.write(chunk)
+                    received_bytes += len(chunk)
+                    
                     if progress_callback:
-                        percent = int((bytes_sent / file_size) * 100) if file_size > 0 else 100
-                        await progress_callback(bytes_sent, file_size, percent, 'upload')
+                        percent = int((received_bytes / file_size) * 100) if file_size > 0 else 100
+                        await progress_callback(received_bytes, file_size, percent, 'download')
 
-            # 4. Wait for receiver ACK
-            ack = await asyncio.wait_for(reader.read(2), timeout=10.0)
-            if ack == b"OK":
-                logger.info(f"Successfully transferred '{filename}' ({bytes_sent} bytes) over Wi-Fi Direct!")
-            else:
-                logger.warning(f"File transfer completed but unexpected ACK: {ack}")
+            # Validate received bytes matches file_size
+            if received_bytes != file_size:
+                logger.error(f"Transfer incomplete. Expected {file_size}, got {received_bytes}")
+                writer.close()
+                await writer.wait_closed()
+                return False
+
+            # 4. Send acknowledgment back to client
+            writer.write(b"OK")
+            await writer.drain()
+            logger.info(f"Successfully received '{filename}'")
+
+            if on_file_received:
+                await on_file_received(filename, save_path, received_bytes)
 
             writer.close()
             await writer.wait_closed()
             return True
 
         except Exception as e:
-            logger.error(f"TCP Transfer Failed to {host_ip}:{PORT}: {e}")
+            logger.error(f"Error receiving file: {e}")
             return False
 
     def teardown(self):

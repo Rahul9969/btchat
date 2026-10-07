@@ -23,11 +23,25 @@ export class DaemonTransport implements Transport {
     memberCount: 1
   };
 
+  private async fetchToken(): Promise<string> {
+    try {
+      const res = await fetch("/api/token");
+      const data = await res.json();
+      if (data.token) return data.token;
+      throw new Error(data.error || "No token returned");
+    } catch (e) {
+      console.error("Failed to fetch token:", e);
+      throw new Error("Ensure airdrop-daemon.py is running. " + String(e));
+    }
+  }
+
   private async ensureWS(): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
     
+    const token = await this.fetchToken();
+    
     return new Promise((resolve, reject) => {
-      this.ws = new WebSocket("ws://127.0.0.1:8765?token=airdrop_dev_token");
+      this.ws = new WebSocket(`ws://127.0.0.1:8765?token=${token}`);
       
       this.ws.onopen = () => {
          console.log("Connected to AirDrop-X Native Daemon");
@@ -47,17 +61,40 @@ export class DaemonTransport implements Transport {
              this.groupInfo.memberCount = this.peers.size + 1;
              this.emitPeerEvent({ type: "connected", peerId: data.peer_id });
           }
+        } else if (data.type === "PEER_DISCONNECTED") {
+          if (this.peers.has(data.peer_id)) {
+             this.peers.delete(data.peer_id);
+             this.groupInfo.memberCount = this.peers.size + 1;
+             this.emitPeerEvent({ type: "disconnected", peerId: data.peer_id });
+          }
         } else if (data.type === "MESSAGE_RECEIVED") {
-           const frame: Frame = { 
-             type: "TEXT", 
-             text: data.payload,
-             textId: Date.now().toString(),
-             senderId: data.peer || "unknown",
-             senderName: data.peer ? data.peer.substring(0, 6) : "Peer",
-             sentAt: Date.now()
-           };
-           // We route incoming messages to the UI listeners
-           this.frameListeners.forEach(l => l(frame, data.peer));
+           try {
+             // Parse the payload as a JSON frame
+             const parsed = JSON.parse(data.payload);
+             
+             if (!parsed || typeof parsed !== 'object' || !parsed.type) {
+               console.warn("Invalid frame payload received:", data.payload);
+               return;
+             }
+
+             // Basic runtime schema validation based on frame type
+             const frameType = parsed.type;
+             if (!["JOIN", "JOIN_ACK", "LEAVE", "MEMBER_LIST", "TEXT", "FILE_OFFER", "FILE_CHUNK", "FILE_DONE", "CLOSE"].includes(frameType)) {
+               console.warn("Unknown frame type received:", frameType);
+               return;
+             }
+             
+             const frame = parsed as Frame;
+             
+             // To prevent impersonation, force the senderId to be the actual peer ID that sent the message.
+             // If it's a TEXT frame, we force it here.
+             if (frame.type === "TEXT") {
+                 frame.senderId = data.peer || "unknown";
+             }
+             this.frameListeners.forEach(l => l(frame, data.peer));
+           } catch (e) {
+             console.warn("Failed to parse JSON frame payload:", data.payload, e);
+           }
         } else if (data.type === "FILE_INCOMING") {
            const frame: Frame = { 
              type: "FILE_OFFER", 
@@ -110,33 +147,72 @@ export class DaemonTransport implements Transport {
   }
 
   async send(frame: Frame, to?: PeerId[]): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon WebSocket is not connected.");
+    }
     
-    if (frame.type === "TEXT") {
-      // In btchat, Host sends to specific targets, but Members send to "HOST_PEER_ID"
-      // In AirDrop-X Mesh, we just send to all known peers for simplicity of the UI mapping.
-      const targets = this.peers.size > 0 ? Array.from(this.peers) : ["ffffffffffff"];
-      
-      for (const target of targets) {
-         this.ws.send(JSON.stringify({
-            type: "SEND_MESSAGE",
-            target_peer: target,
-            payload: frame.text
-         }));
+    const payload = JSON.stringify(frame);
+    const targets = to && to.length > 0 ? to : (this.peers.size > 0 ? Array.from(this.peers) : ["ffffffffffff"]);
+    
+    for (const target of targets) {
+       this.ws.send(JSON.stringify({
+          type: "SEND_MESSAGE",
+          target_peer: target,
+          payload: payload
+       }));
+    }
+  }
+
+  async sendFile(file: File, to?: PeerId[]): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon WebSocket is not connected.");
+    }
+    
+    // Stage file chunks
+    const CHUNK_SIZE = 1024 * 512; // 512KB chunks
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    
+    for (let i = 0; i < totalChunks; i++) {
+      const blob = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+      const arrayBuffer = await blob.arrayBuffer();
+      // base64 encode for browser
+      const uint8 = new Uint8Array(arrayBuffer);
+      let binary = '';
+      for (let j = 0; j < uint8.byteLength; j++) {
+        binary += String.fromCharCode(uint8[j]);
       }
-    } else if (frame.type === "JOIN") {
-      // Ignore, daemon handles handshakes
+      const base64 = btoa(binary);
+      
+      this.ws.send(JSON.stringify({
+         type: "STAGE_FILE_CHUNK",
+         file_name: file.name,
+         chunk: base64,
+         chunk_index: i,
+         total_chunks: totalChunks
+      }));
+      // wait a bit for daemon to process
+      await new Promise(r => setTimeout(r, 50));
+    }
+    
+    const targets = to && to.length > 0 ? to : (this.peers.size > 0 ? Array.from(this.peers) : ["ffffffffffff"]);
+    
+    for (const target of targets) {
+       this.ws.send(JSON.stringify({
+          type: "SEND_FILE",
+          target_peer: target,
+          file_name: file.name
+       }));
     }
   }
 
   onFrame(callback: FrameListener): Unsubscribe {
     this.frameListeners.add(callback);
-    return () => this.frameListeners.delete(callback);
+    return () => { this.frameListeners.delete(callback); };
   }
   
   onPeerEvent(callback: PeerListener): Unsubscribe {
     this.peerListeners.add(callback);
-    return () => this.peerListeners.delete(callback);
+    return () => { this.peerListeners.delete(callback); };
   }
 
   private emitPeerEvent(event: PeerEvent) {

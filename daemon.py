@@ -18,8 +18,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KEY_FILE = os.path.join(BASE_DIR, "private_key.pem")
 STAGING_DIR = os.path.join(BASE_DIR, "staging")
 RECEIVED_DIR = os.path.join(BASE_DIR, "received_files")
+TOKEN_FILE = os.path.join(BASE_DIR, "ws_token.txt")
 os.makedirs(STAGING_DIR, exist_ok=True)
 os.makedirs(RECEIVED_DIR, exist_ok=True)
+
+# Generate a random token for this session
+ws_token = base64.urlsafe_b64encode(os.urandom(16)).decode('utf-8').rstrip('=')
+with open(TOKEN_FILE, "w") as f:
+    f.write(ws_token)
 
 # ─── Key Management ────────────────────────────────────────────────────────────
 if os.path.exists(KEY_FILE):
@@ -48,6 +54,7 @@ clients = set()
 peer_keys = {}            # peer_id_hex -> 32-byte derived ChaCha20 key
 peer_public_keys = {}     # peer_id_hex -> 32-byte public key
 shaken_peers = set()      # peer_ids we have reciprocated handshake with
+peer_last_seen = {}       # peer_id_hex -> float timestamp
 ble_engine = BLEFountainEngine()
 wifi_direct = WiFiDirectManager()
 
@@ -57,10 +64,32 @@ async def broadcast_handshake():
     await ble_engine.broadcast_message(os.urandom(1)[0], handshake_payload)
 
 async def discovery_heartbeat():
-    """Keep discovery working when a nearby laptop starts after this one."""
+    """Keep discovery working when a nearby laptop starts after this one, and track dropouts."""
     while True:
         try:
             await broadcast_handshake()
+            
+            # Check for timed out peers
+            now = asyncio.get_event_loop().time()
+            disconnected_peers = []
+            for pid, last_seen in list(peer_last_seen.items()):
+                if now - last_seen > 30.0:  # 30 seconds timeout
+                    disconnected_peers.append(pid)
+                    
+            for pid in disconnected_peers:
+                logger.info(f"Peer {pid} timed out. Emitting PEER_DISCONNECTED.")
+                del peer_last_seen[pid]
+                if pid in peer_keys:
+                    del peer_keys[pid]
+                if pid in peer_public_keys:
+                    del peer_public_keys[pid]
+                if pid in shaken_peers:
+                    shaken_peers.remove(pid)
+                    
+                await notify_clients({
+                    "type": "PEER_DISCONNECTED",
+                    "peer_id": pid
+                })
         except Exception as e:
             logger.warning(f"Periodic BLE discovery beacon failed: {e}")
         await asyncio.sleep(7.0)
@@ -90,12 +119,9 @@ async def notify_clients(event_data: dict):
 async def handle_incoming_file_offer(pin: str, file_name: str, file_size: int):
     """Coordinates connecting to a Wi-Fi Direct group to receive an offered file."""
     try:
-        logger.info(f"Connecting to Wi-Fi Direct group to receive '{file_name}' ({file_size} bytes)...")
-        connected = await wifi_direct.connect_to_group(pin)
-        
         # In prototype/LAN fallback, host IP defaults to 192.168.137.1 or 127.0.0.1
-        host_ip = "192.168.137.1" if connected else "127.0.0.1"
-        
+        host_ip = "127.0.0.1" # Default to localhost for now, connect_receive_file will do Wi-Fi Direct if needed
+
         async def on_dl_progress(bytes_rx, total, percent, direction):
             await notify_clients({
                 "type": "FILE_PROGRESS",
@@ -105,12 +131,23 @@ async def handle_incoming_file_offer(pin: str, file_name: str, file_size: int):
                 "direction": direction,
                 "file_name": file_name
             })
+            
+        async def file_rx_hook(received_name, path, size):
+            await notify_clients({
+                "type": "FILE_RECEIVED",
+                "file_name": received_name,
+                "path": path,
+                "size": size
+            })
 
-        # Start listening/receiving on local connection if host is acting as TCP client,
-        # or connect directly to host server
         logger.info(f"Receiving file from {host_ip}...")
-        save_path = os.path.join(RECEIVED_DIR, file_name)
-        # Sockets will perform transfer via wifi_direct server or client
+        
+        await wifi_direct.connect_receive_file(
+            pin=pin, 
+            host_ip=host_ip, 
+            progress_callback=on_dl_progress,
+            on_file_received=file_rx_hook
+        )
     except Exception as e:
         logger.error(f"Failed handling incoming file offer: {e}")
 
@@ -134,6 +171,8 @@ async def process_ble_payload(payload: bytes):
 
             logger.info(f"Discovered peer via BLE Handshake: {sender_id}")
             is_new = sender_id not in peer_keys
+
+            peer_last_seen[sender_id] = asyncio.get_event_loop().time()
 
             # Derive and store ChaCha20-Poly1305 symmetric key via HKDF
             peer_keys[sender_id] = derive_symmetric_key(remote_pub)
@@ -189,6 +228,7 @@ async def process_ble_payload(payload: bytes):
             return # Packet not meant for this node
 
         if sender_id in peer_keys:
+            peer_last_seen[sender_id] = asyncio.get_event_loop().time()
             chacha_key = peer_keys[sender_id]
             chacha = ChaCha20Poly1305(chacha_key)
             try:
@@ -212,9 +252,16 @@ async def process_ble_payload(payload: bytes):
     except Exception as e:
         logger.error(f"Failed to process BLE payload: {e}")
 
-# ─── Local WebSocket Bridge (UI <-> Daemon) ──────────────────────────────────
 async def handle_ws(websocket):
-    if hasattr(websocket, 'request') and "token=airdrop_dev_token" not in websocket.request.path:
+    # Security: check Origin header
+    origin = websocket.request.headers.get("Origin")
+    if origin not in ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost", "http://127.0.0.1"]:
+        logger.warning(f"Rejected WS connection from unauthorized origin: {origin}")
+        await websocket.close(code=1008, reason="Unauthorized Origin")
+        return
+
+    if hasattr(websocket, 'request') and f"token={ws_token}" not in websocket.request.path:
+        logger.warning("Rejected WS connection with invalid token")
         await websocket.close(code=1008, reason="Unauthorized")
         return
 
@@ -346,16 +393,12 @@ async def handle_ws(websocket):
                         "file_name": clean_name
                     })
 
-                async def file_rx_hook(received_name, path, size):
-                    await notify_clients({
-                        "type": "FILE_RECEIVED",
-                        "file_name": received_name,
-                        "path": path,
-                        "size": size
-                    })
-
-                # Host Wi-Fi direct group and TCP server
-                await wifi_direct.host_group(pin, on_file_received=file_rx_hook, on_progress=progress_hook)
+                # Host Wi-Fi direct group and TCP server to send the file
+                asyncio.create_task(wifi_direct.host_send_file(
+                    file_path=file_path, 
+                    pin=pin, 
+                    progress_callback=progress_hook
+                ))
 
                 # Broadcast FILE_OFFER with real size and file name via BLE Mesh
                 msg_id = os.urandom(1)[0]
@@ -363,19 +406,13 @@ async def handle_ws(websocket):
                     ble_engine.broadcast_file_offer(msg_id, target_bytes, pin, real_size, clean_name)
                 )
 
-                # Wait for peer connection or timeout
-                async def complete_transfer():
-                    has_peer = await wifi_direct.wait_for_peer_connection(timeout=25.0)
-                    if has_peer and wifi_direct.peer_ip:
-                        await wifi_direct.send_file(wifi_direct.peer_ip, file_path, pin, progress_callback=progress_hook)
-                    await notify_clients({
-                        "type": "FILE_SENT",
-                        "status": "success",
-                        "file_name": clean_name,
-                        "size": real_size
-                    })
-
-                asyncio.create_task(complete_transfer())
+                # Send success message back to UI immediately
+                await websocket.send(json.dumps({
+                    "type": "FILE_SENT",
+                    "status": "success",
+                    "file_name": clean_name,
+                    "size": real_size
+                }))
 
     finally:
         clients.remove(websocket)

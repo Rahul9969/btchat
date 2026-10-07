@@ -1,4 +1,4 @@
-import { DISPLAY_NAME_MAX, HOST_PEER_ID } from "@/lib/ble/constants";
+import { DISPLAY_NAME_MAX, HOST_PEER_ID, MAX_MEMBERS } from "@/lib/ble/constants";
 import type { Frame, GroupMember } from "@/lib/ble/frames";
 import type { GroupInfo, PeerEvent, PeerId, Transport, Unsubscribe } from "@/lib/ble/transport";
 import { randomId } from "@/lib/id";
@@ -67,13 +67,21 @@ export class HostSession {
         return this.run(this.addMember(from, frame.displayName));
       case "LEAVE":
         return this.run(this.removeMember(from));
-      case "TEXT":
+      case "TEXT": {
+        const member = this.members.find((m) => m.memberId === from);
+        if (!member) return; // Drop messages from unknown peers
+        
+        // Prevent impersonation: override with trusted identity
+        frame.senderId = member.memberId;
+        frame.senderName = member.displayName;
+
         this.sink.text(frame.textId, frame.senderId, frame.senderName, frame.text, frame.sentAt, false);
         const others = this.members.filter((m) => m.memberId !== HOST_PEER_ID && m.memberId !== from).map((m) => m.memberId);
         if (others.length > 0) {
           this.run(this.transport.send(frame, others));
         }
         return;
+      }
       default:
         // FILE_* Frames are handled in Phase 4.
         return;
@@ -89,8 +97,16 @@ export class HostSession {
   }
 
   private async addMember(peerId: PeerId, rawName: string): Promise<void> {
-    const displayName = sanitizeName(rawName, DISPLAY_NAME_MAX, "Member");
     const others = this.members.filter((m) => m.memberId !== peerId);
+    
+    // MAX_MEMBERS does not include the Host. 'others' includes the host.
+    // So others.length >= MAX_MEMBERS + 1 means the group is full.
+    if (others.length >= MAX_MEMBERS + 1) {
+      this.sink.system(`Join request from ${rawName} rejected (group is full).`);
+      return;
+    }
+    
+    const displayName = sanitizeName(rawName, DISPLAY_NAME_MAX, "Member");
     this.members = sortMembers([...others, { memberId: peerId, displayName, isHost: false }]);
     await this.transport.send(
       { type: "JOIN_ACK", memberId: peerId, groupId: this.group.groupId, groupName: this.group.groupName },

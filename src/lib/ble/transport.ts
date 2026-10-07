@@ -63,6 +63,9 @@ export interface Transport {
    * Member: always sends to the Host; `to` is ignored.
    */
   send(frame: Frame, to?: PeerId[]): Promise<void>;
+  /** Sends a file to peers */
+  sendFile?(file: File, to?: PeerId[]): Promise<void>;
+  
   onFrame(callback: FrameListener): Unsubscribe;
   onPeerEvent(callback: PeerListener): Unsubscribe;
 

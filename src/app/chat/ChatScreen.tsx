@@ -42,6 +42,7 @@ function ChatMessage({ item }: { item: ReturnType<typeof useChatStore.getState>[
 
 function InputArea() {
   const [text, setText] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   function onSubmit(event: FormEvent) {
     event.preventDefault();
@@ -50,9 +51,30 @@ function InputArea() {
     setText("");
   }
 
+  function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) {
+      sendFile(file).catch((err) => console.error(err));
+      // Reset input so the same file can be selected again
+      event.target.value = '';
+    }
+  }
+
   return (
     <form onSubmit={onSubmit} className="safe-x flex items-end gap-2 bg-ink-950 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3">
-      <Button variant="secondary" size="icon" className="shrink-0 rounded-full" onClick={() => sendFile(new File([], "tmp"))}>
+      <input 
+        type="file" 
+        ref={fileInputRef} 
+        onChange={handleFileChange} 
+        className="hidden" 
+      />
+      <Button 
+        type="button"
+        variant="secondary" 
+        size="icon" 
+        className="shrink-0 rounded-full" 
+        onClick={() => fileInputRef.current?.click()}
+      >
         <PaperclipIcon />
       </Button>
       <input

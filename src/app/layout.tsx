@@ -23,8 +23,8 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html lang="en" className={`${inter.variable} ${outfit.variable} h-full antialiased`}>
-      <body className="relative min-h-full overflow-x-hidden bg-ink-950">
+    <html lang="en" suppressHydrationWarning className={`${inter.variable} ${outfit.variable} h-full antialiased`}>
+      <body suppressHydrationWarning className="relative min-h-full overflow-x-hidden bg-ink-950">
         <AuroraBackground />
         <div className="relative z-10 flex min-h-dvh flex-col">{children}</div>
       </body>
