@@ -24,15 +24,9 @@ export class DaemonTransport implements Transport {
   };
 
   private async fetchToken(): Promise<string> {
-    try {
-      const res = await fetch("/api/token");
-      const data = await res.json();
-      if (data.token) return data.token;
-      throw new Error(data.error || "No token returned");
-    } catch (e) {
-      console.error("Failed to fetch token:", e);
-      throw new Error("Ensure airdrop-daemon.py is running. " + String(e));
-    }
+    const envToken = process.env.NEXT_PUBLIC_WS_TOKEN;
+    if (envToken) return envToken;
+    throw new Error("No token found. Ensure airdrop-daemon.py is running before starting the UI.");
   }
 
   private async ensureWS(): Promise<void> {
