@@ -1,0 +1,9 @@
+bleak>=0.21.1
+winrt-Windows.Devices.Bluetooth.Advertisement
+winrt-Windows.Devices.Bluetooth
+winrt-Windows.Devices.WiFiDirect
+reedsolo>=1.1.8
+cryptography>=41.0.3
+websockets>=11.0.3
+winrt-Windows.Security.Credentials
+winrt-Windows.Devices.Enumeration

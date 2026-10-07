@@ -1,0 +1,4 @@
+websockets
+scapy
+cryptography
+reedsolo

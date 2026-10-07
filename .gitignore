@@ -23,6 +23,10 @@
 # misc
 .DS_Store
 *.pem
+__pycache__/
+*.py[cod]
+staging/
+received_files/
 
 # debug
 npm-debug.log*
