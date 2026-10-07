@@ -1,4 +1,5 @@
 import { MockTransport } from "./mockTransport";
+import { DaemonTransport } from "./daemonTransport";
 import { notImplemented, type Transport, type TransportCapabilities, type TransportKind } from "./transport";
 
 const KINDS: readonly TransportKind[] = ["mock", "web-bluetooth", "native"];
@@ -6,7 +7,7 @@ const KINDS: readonly TransportKind[] = ["mock", "web-bluetooth", "native"];
 export const TRANSPORT_LABELS: Record<TransportKind, string> = {
   mock: "Mock (BroadcastChannel)",
   "web-bluetooth": "Web Bluetooth",
-  native: "Native BLE",
+  native: "AirDrop-X Native",
 };
 
 export const TRANSPORT_CAPABILITIES: Record<TransportKind, TransportCapabilities> = {
@@ -25,18 +26,11 @@ function isTransportKind(value: string | undefined): value is TransportKind {
  */
 export function selectTransportKind(): TransportKind {
   const forced = process.env.NEXT_PUBLIC_TRANSPORT;
-  return isTransportKind(forced) ? forced : "mock";
+  return isTransportKind(forced) ? forced : "native";
 }
 
 function createTransport(kind: TransportKind): Transport {
-  switch (kind) {
-    case "mock":
-      return new MockTransport();
-    case "web-bluetooth":
-      return notImplemented("WebBluetoothTransport (Phase 5)");
-    case "native":
-      return notImplemented("NativeBleTransport (Phase 6)");
-  }
+  return new DaemonTransport();
 }
 
 let instance: Transport | null = null;

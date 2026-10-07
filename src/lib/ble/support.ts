@@ -39,6 +39,6 @@ export async function checkTransportSupport(kind: TransportKind): Promise<Suppor
     case "web-bluetooth":
       return checkWebBluetoothSupport();
     case "native":
-      return { supported: false, reason: "NOT IMPLEMENTED: native BLE support check (Phase 6)." };
+      return { supported: true };
   }
 }
